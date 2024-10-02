@@ -190,12 +190,12 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
-// Serve static files from the Vite `dist` folder
-app.use(express.static(path.join(__dirname, 'dist')));
+// Serve static files from the Vite build directory
+app.use(express.static(path.join(__dirname, 'frontend', 'dist')));
 
 // Fallback route to serve index.html for all unknown routes (Single Page Application)
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+  res.sendFile(path.join(__dirname, 'frontend', 'dist', 'index.html'));
 });
 
 
