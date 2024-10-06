@@ -1,192 +1,195 @@
 const express = require('express');
-const mongoose = require('mongoose');
 const bodyParser = require('body-parser');
+const mongoose = require('mongoose');
+const cors = require('cors');
 const path = require('path');
-const { formatInTimeZone } = require('date-fns-tz');
+const moment = require('moment-timezone');
 
+// Load the timezone data
+moment.tz.load(require('moment-timezone/data/packed/latest.json'));
 
 const app = express();
-const PORT = process.env.PORT || 3001;
-
-// Middleware
 app.use(bodyParser.json());
+app.use(cors());
 
-// MongoDB connection
+// MongoDB connection string (using your connection string)
 const mongoURI = 'mongodb+srv://barryjacob08:HrpYPLgajMiRJBgN@cluster0.ssafp.mongodb.net/yourDBName?retryWrites=true&w=majority';
+
 mongoose.connect(mongoURI, { useNewUrlParser: true, useUnifiedTopology: true })
   .then(() => console.log('MongoDB connected successfully'))
   .catch(err => console.error('MongoDB connection error:', err));
 
-// User and Attendance Schemas
+// User schema
 const userSchema = new mongoose.Schema({
-  name: { type: String, required: true },
-  email: { type: String, required: true, unique: true },
-  phone: { type: String, required: true, unique: true },
-  location: { type: String, required: true },
+  name: String,
+  phone: String,
+  email: { type: String, unique: true },
+  location: String,
+  session: String
 });
 
+// Updated Attendance schema with reference to User
 const attendanceSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  session: { type: String, required: true },
-  date: { type: Date, default: Date.now },
+  user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  session: String,
+  time: String,
+  date: { type: Date, default: Date.now }
 });
 
 const User = mongoose.model('User', userSchema);
 const Attendance = mongoose.model('Attendance', attendanceSchema);
 
-// Session groups for attendance
-const sessionGroups = {
-  ministrySchool: ['MinistrySchool1', 'MinistrySchool2', 'MinistrySchool3'],
-  class: ['Class1', 'Class2'],
+// Time window function to determine if the current time is within any defined window
+const checkAttendanceWindow = (time) => {
+  const windows = [
+    { start: '00:00', end: '15:00' },
+    { start: '15:01', end: '18:00' },
+    { start: '19:00', end: '20:00' },
+    { start: '21:00', end: '22:00' },
+  ];
+
+  const nowInGMT1 = moment.tz(time, "Africa/Lagos"); // Change to "Africa/Lagos"
+  const current = nowInGMT1.hours() * 60 + nowInGMT1.minutes();
+
+  return windows.find(window => {
+    const [startHour, startMin] = window.start.split(':').map(Number);
+    const [endHour, endMin] = window.end.split(':').map(Number);
+    return current >= startHour * 60 + startMin && current <= endHour * 60 + endMin;
+  });
 };
 
-// 1. Register a new user
-app.post('/api/register', async (req, res) => {
-  const { name, email, phone, location } = req.body;
-
-  try {
-    // Check for duplicate email or phone
-    const existingUserByEmail = await User.findOne({ email });
-    if (existingUserByEmail) {
-      return res.status(400).json({ success: false, message: 'Email is already in use' });
-    }
-
-    const existingUserByPhone = await User.findOne({ phone });
-    if (existingUserByPhone) {
-      return res.status(400).json({ success: false, message: 'Phone number is already in use' });
-    }
-
-    // Create new user
-    const newUser = new User({ name, email, phone, location });
-    await newUser.save();
-    res.status(201).json({ success: true, user: newUser });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// 2. Check if a user exists
-app.get('/api/user/:email', async (req, res) => {
-  const { email } = req.params;
+// Endpoint to handle login
+app.post('/api/login/:role', async (req, res) => {
+  const { email } = req.body;
+  const now = new Date();
+  const attendanceWindow = checkAttendanceWindow(now);
 
   try {
     const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(404).json({ success: false, message: 'User not found' });
-    }
-    res.json({ success: true, user });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// 3. Mark attendance for a session
-app.post('/api/mark-attendance', async (req, res) => {
-  const { email, session } = req.body;
-
-  try {
-    const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found' });
-    }
-
-    // Get today's date in GMT+1
-    const today = new Date();
-    const gmtPlus1 = formatInTimeZone(today, 'Europe/Berlin', "yyyy-MM-dd'T'00:00:00.000xxx");
-    const endOfDay = formatInTimeZone(today, 'Europe/Berlin', "yyyy-MM-dd'T'23:59:59.999xxx");
-
-    const existingAttendance = await Attendance.findOne({
-      userId: user._id,
-      session,
-      date: {
-        $gte: new Date(gmtPlus1),
-        $lt: new Date(endOfDay),
-      },
-    });
-
-    if (existingAttendance) {
-      return res.json({ success: false, code: 'ALREADY_MARKED', message: 'User has already marked attendance today' });
-    }
-
-    // Check if session belongs to a group and overwrite if necessary
-    let canOverride = false;
-    for (let group in sessionGroups) {
-      if (sessionGroups[group].includes(session)) {
-        // Check if there is any attendance for today in the group
-        const groupAttendances = await Attendance.find({
-          userId: user._id,
-          session: { $in: sessionGroups[group] },
-          date: {
-            $gte: new Date(gmtPlus1),
-            $lt: new Date(endOfDay),
-          },
-        });
-
-        if (groupAttendances.length > 0) {
-          canOverride = true;
-          await Attendance.deleteMany({ userId: user._id, session: { $in: sessionGroups[group] } });
-          break; // Exit the loop since we will override
-        }
+    if (user) {
+      if (attendanceWindow) {
+        await Attendance.findOneAndUpdate(
+          { user: user._id, time: { $gte: attendanceWindow.start, $lte: attendanceWindow.end } },
+          { session: req.params.role, time: moment().tz("Africa/Lagos").format('HH:mm'), date: moment().tz("Africa/Lagos").format('YYYY-MM-DD') },
+          { upsert: true }
+        );
+        return res.json({ success: true, session: req.params.role, time: moment().tz("Africa/Lagos").format('HH:mm'), date: moment().tz("Africa/Lagos").format('YYYY-MM-DD'), name: user.name });
+      } else {
+        return res.json({ success: true, message: "User found, but outside attendance window.", name: user.name });
       }
-    }
-
-    // Mark new attendance
-    const newAttendance = new Attendance({ userId: user._id, session });
-    await newAttendance.save();
-    res.json({ success: true, attendance: newAttendance });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// 4. Get session information (per day)
-app.get('/api/session/:session', async (req, res) => {
-  const { session } = req.params;
-  const today = new Date();
-  const gmtPlus1 = formatInTimeZone(today, 'Europe/Berlin', "yyyy-MM-dd'T'00:00:00.000xxx");
-  const endOfDay = formatInTimeZone(today, 'Europe/Berlin', "yyyy-MM-dd'T'23:59:59.999xxx");
-
-  try {
-    const attendances = await Attendance.find({
-      session,
-      date: {
-        $gte: new Date(gmtPlus1),
-        $lt: new Date(endOfDay),
-      },
-    }).populate('userId', 'name location phone email');
-
-    res.json({ success: true, attendances });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// 5. Get all registered users or attendees
-app.get('/api/users', async (req, res) => {
-  const { type } = req.query; // 'registered' or 'attendees'
-
-  try {
-    let users;
-    if (type === 'attendees') {
-      const today = new Date();
-      const gmtPlus1 = formatInTimeZone(today, 'Europe/Berlin', "yyyy-MM-dd'T'00:00:00.000xxx");
-      const endOfDay = formatInTimeZone(today, 'Europe/Berlin', "yyyy-MM-dd'T'23:59:59.999xxx");
-
-      const attendees = await Attendance.find({
-        date: {
-          $gte: new Date(gmtPlus1),
-          $lt: new Date(endOfDay),
-        },
-      }).populate('userId', 'name location phone email');
-
-      users = attendees.map(att => att.userId);
     } else {
-      users = await User.find();
+      return res.json({ success: false, message: "Email not found." });
+    }
+  } catch (err) {
+    console.error('Error during login:', err);
+    res.status(500).json({ success: false, message: 'Server error during login. Check logs for details.' });
+  }
+});
+
+// Endpoint to handle registration and attendance marking
+app.post('/api/register', async (req, res) => {
+  const { name, phone, email, location } = req.body;
+  const now = new Date();
+  const attendanceWindow = checkAttendanceWindow(now);
+
+  try {
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = new User({ name, phone, email, location, session: 'new' });
+      await user.save();
     }
 
-    res.json({ success: true, users });
-  } catch (error) {
-    res.status(500).json({ success: false, message: error.message });
+    if (attendanceWindow) {
+      const newAttendance = new Attendance({
+        user: user._id,
+        session: 'new',
+        time: moment().tz("Africa/Lagos").format('HH:mm'),
+        date: moment().tz("Africa/Lagos").format('YYYY-MM-DD')
+      });
+      await newAttendance.save();
+      return res.json({ success: true, session: 'new', time: moment().tz("Africa/Lagos").format('HH:mm'), date: moment().tz("Africa/Lagos").format('YYYY-MM-DD'), name: user.name });
+    } else {
+      return res.json({ success: true, message: "User registered but not within the attendance window." });
+    }
+  } catch (err) {
+    console.error('Error during registration:', err);
+    res.status(500).json({ success: false, message: 'Server error during registration. Check logs for details.' });
+  }
+});
+
+// Endpoint to handle registration only (if needed)
+app.post('/api/registerr', async (req, res) => {
+  const { name, phone, email, location } = req.body;
+
+  try {
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ success: false, message: 'Email already registered.' });
+    }
+
+    const newUser = new User({ name, phone, email, location });
+    await newUser.save();
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Error during registration:', err);
+    res.status(500).json({ success: false, message: 'Server error during registration. Check logs for details.' });
+  }
+});
+
+// Endpoint to fetch attendance for a specific session and date (with user details)
+app.get('/api/attendance', async (req, res) => {
+  const { session, date } = req.query;
+  try {
+    const attendees = await Attendance.find({ session, date })
+      .populate('user', 'name email phone location') // Populate user details (select specific fields)
+      .exec();
+
+    res.json(attendees.map(attendance => ({
+      name: attendance.user.name,
+      email: attendance.user.email,
+      phone: attendance.user.phone,
+      location: attendance.user.location,
+      session: attendance.session,
+      time: attendance.time,
+      date: attendance.date
+    })));
+  } catch (err) {
+    console.error('Error fetching attendance:', err);
+    res.status(500).json({ message: 'Error fetching attendance.' });
+  }
+});
+
+// Endpoint to fetch all attendees (with user details)
+app.get('/api/attendees', async (req, res) => {
+  try {
+    const attendees = await Attendance.find({})
+      .populate('user', 'name email phone location') // Populate user details
+      .exec();
+
+    res.json(attendees.map(attendance => ({
+      name: attendance.user.name,
+      email: attendance.user.email,
+      phone: attendance.user.phone,
+      location: attendance.user.location,
+      session: attendance.session,
+      time: attendance.time,
+      date: attendance.date
+    })));
+  } catch (err) {
+    console.error('Error fetching all attendees:', err);
+    res.status(500).json({ message: 'Error fetching attendees.' });
+  }
+});
+
+// Endpoint to fetch all users
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await User.find({});
+    res.json(users);
+  } catch (err) {
+    console.error('Error fetching users:', err);
+    res.status(500).json({ message: 'Error fetching users.' });
   }
 });
 
@@ -198,8 +201,5 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'frontend', 'dist', 'index.html'));
 });
 
-
 // Start the server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(3000, () => console.log('Server running on port 3000'));
